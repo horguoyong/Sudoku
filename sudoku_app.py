@@ -1,408 +1,425 @@
 import json
-import re
 import time
+
 import streamlit as st
-from utils import *
-from logic_ import *
+
+from logic_ import conjuncts, is_prop_symbol
 from sudoku_solver import (
     atom,
     build_definite_kb,
     build_general_kb,
     solve_full_grid_fc,
-    solve_full_grid_fc_cached,
     solve_full_grid_bc,
     pl_bc_entails,
-    justifications,
-    proof_steps,
-    bc_unproven_premises,
 )
 
-st.title('Sudoku Solver')
 
-with open('puzzles.json') as f:
-    pool = json.load(f)
-
-# --- 1. Puzzle selection & visual board display ---
-n, box_h, box_w = pool['n'], pool['box_h'], pool['box_w']
-
-st.sidebar.header('Settings')
-option = st.sidebar.selectbox(
-    "Puzzle selection",
-    (i for i in range(1, len(pool['puzzles']) + 1))
-)
-
-# givens keyed as (row, col), 1-indexed, to match the solver's expected input
-givens = {
-    tuple(int(x) for x in k.split('_')): v
-    for k, v in pool['puzzles'][option - 1]['givens'].items()
-}
-
-# cell backgrounds for highlighting; translucent so they suit either theme
-NEW_BG = 'rgba(255, 190, 0, 0.45)'
-CAUSE_BG = 'rgba(31, 119, 180, 0.22)'
+st.set_page_config(page_title="Sudoku Solver", layout="wide")
 
 
-def render_grid(values, givens, target=st, new=None, causes=()):
-    """Render an n x n grid as an HTML table with thick box borders.
+# ---------- Load puzzles ----------
 
-    values : dict[(int, int), int] -- cells to display
-    givens : dict[(int, int), int] -- cells to show in bold
-    target : where to draw it; pass an st.empty() to replace what's there
-    new    : (int, int) -- a cell to highlight as just deduced
-    causes : cells to highlight as the reasons for that deduction
-    """
-    rows = []
+@st.cache_data
+def load_puzzles():
+    with open("puzzles.json", encoding="utf-8") as file:
+        data = json.load(file)
+
+    puzzles = []
+    for item in data["puzzles"]:
+        givens = {
+            tuple(map(int, key.split("_"))): value
+            for key, value in item["givens"].items()
+        }
+        puzzles.append({"givens": givens})
+
+    return data["n"], data["box_h"], data["box_w"], puzzles
+
+
+# ---------- Display the board ----------
+
+def display_board(n, box_h, box_w, givens, values):
+    """Show givens in blue and inferred values in green."""
+    html = ['<table style="border-collapse:collapse;margin:12px 0;">']
+
     for r in range(1, n + 1):
-        cells = []
-        for c in range(1, n + 1):
-            style = [
-                'width:2.2em', 'height:2.2em', 'text-align:center',
-                'font-size:1.2em', 'border:1px solid #999',
-            ]
-            if r % box_h == 1 or box_h == 1:
-                style.append('border-top:3px solid currentColor')
-            if r == n:
-                style.append('border-bottom:3px solid currentColor')
-            if c % box_w == 1 or box_w == 1:
-                style.append('border-left:3px solid currentColor')
-            if c == n:
-                style.append('border-right:3px solid currentColor')
-            if (r, c) == new:
-                style.append(f'background:{NEW_BG}')
-            elif (r, c) in causes:
-                style.append(f'background:{CAUSE_BG}')
+        html.append("<tr>")
 
-            v = values.get((r, c), '')
-            if (r, c) in givens:
-                text = f'<b>{v}</b>'
-            else:
-                text = f'<span style="color:#1f77b4">{v}</span>'
-            cells.append(f'<td style="{";".join(style)}">{text}</td>')
-        rows.append(f'<tr>{"".join(cells)}</tr>')
-    target.markdown(
-        f'<table style="border-collapse:collapse">{"".join(rows)}</table>',
-        unsafe_allow_html=True,
+        for c in range(1, n + 1):
+            value = values.get((r, c), "")
+            is_given = (r, c) in givens
+
+            background = "#dbeafe" if is_given else "#ffffff"
+            color = "#1e3a8a" if is_given else "#166534"
+
+            top = 3 if (r - 1) % box_h == 0 else 1
+            left = 3 if (c - 1) % box_w == 0 else 1
+            bottom = 3 if r == n else 1
+            right = 3 if c == n else 1
+
+            html.append(
+                f'<td style="width:38px;height:38px;text-align:center;'
+                f'font-size:20px;font-weight:600;'
+                f'background:{background};color:{color};'
+                f'border-top:{top}px solid #475569;'
+                f'border-left:{left}px solid #475569;'
+                f'border-bottom:{bottom}px solid #475569;'
+                f'border-right:{right}px solid #475569;">'
+                f'{value}</td>'
+            )
+
+        html.append("</tr>")
+
+    html.append("</table>")
+    st.markdown("".join(html), unsafe_allow_html=True)
+    st.caption("Blue cells are givens. Green numbers are inferred values.")
+
+
+# ---------- Human-readable explanations ----------
+
+def unpack_atom(symbol):
+    name = str(symbol)
+    prefix = "Not" if name.startswith("Not") else "Is"
+    r, c, v = map(int, name[len(prefix):].split("_"))
+    return prefix, r, c, v
+
+
+def describe_atom(symbol):
+    prefix, r, c, v = unpack_atom(symbol)
+
+    if prefix == "Is":
+        return f"Cell ({r}, {c}) contains {v}"
+
+    return f"Cell ({r}, {c}) cannot contain {v}"
+
+
+def explain_rule(conclusion, premises):
+    prefix, r, c, v = unpack_atom(conclusion)
+
+    if prefix == "Is":
+        excluded = sorted(unpack_atom(p)[3] for p in premises)
+        numbers = ", ".join(map(str, excluded))
+        return (
+            f"Values {numbers} have been eliminated from cell "
+            f"({r}, {c}). Its only remaining candidate is {v}."
+        )
+
+    _, source_r, source_c, source_v = unpack_atom(premises[0])
+
+    if (source_r, source_c) == (r, c):
+        return (
+            f"Cell ({r}, {c}) already contains {source_v}, "
+            f"so it cannot also contain {v}."
+        )
+
+    if source_r == r:
+        location = f"row {r}"
+    elif source_c == c:
+        location = f"column {c}"
+    else:
+        location = "the same box"
+
+    return (
+        f"Cell ({source_r}, {source_c}) contains {v} and shares "
+        f"{location} with cell ({r}, {c}). Therefore, "
+        f"cell ({r}, {c}) cannot contain {v}."
     )
 
 
-# --- Reasoning trace helpers ---
-# The solver records how each symbol was derived (justifications / proof_steps
-# in sudoku_solver.py). These only turn that record into plain data for the
-# interface; no inference happens here.
+# ---------- App-specific inference tracing ----------
 
-def parse(symbol):
-    """Split a symbol like Is3_2_4 into ('Is', 3, 2, 4)."""
-    kind, r, c, v = re.fullmatch(r'(Is|Not)(\d+)_(\d+)_(\d+)',
-                                 str(symbol)).groups()
-    return kind, int(r), int(c), int(v)
+def trace_forward_query(kb, query):
+    """Record actual FC deductions and extract a proof of the query.
 
-
-def constraint(a, b):
-    """Name the constraint two cells share, as it would be read aloud."""
-    if a == b:
-        return 'this cell'
-    if a[0] == b[0]:
-        return f'row {a[0]}'
-    if a[1] == b[1]:
-        return f'column {a[1]}'
-    return 'this box'
-
-
-def deductions(why):
-    """Turn a solver's derivation record into one step per cell value placed.
-
-    why : {conclusion: premises}, in the order they were derived -- from
-        justifications(kb), or built from proof_steps(kb, query)
-
-    Returns a list of dicts, one per derived Is symbol, in derivation order:
-        cell, value  -- what was placed
-        symbol       -- the Is symbol, e.g. 'Is1_2_4'
-        reasons      -- one per value ruled out: (value, Not symbol,
-                        cause cell, constraint name, source), where source
-                        is 'given' or the step number that placed the cause
+    This helper provides explanations. Full-grid solving still uses
+    the imported solver functions, and the query verdict uses BC.
     """
-    steps, step_of = [], {}
-    for concl, premises in why.items():
-        kind, r, c, v = parse(concl)
-        if kind != 'Is':
+    facts = {
+        clause for clause in kb.clauses
+        if is_prop_symbol(clause.op)
+    }
+
+    # Duplicate rules can arise from overlapping row/box constraints.
+    rules = list(dict.fromkeys(
+        clause for clause in kb.clauses
+        if clause.op == "==>"
+    ))
+
+    remaining = {}
+    dependents = {}
+
+    for rule in rules:
+        premises = tuple(dict.fromkeys(conjuncts(rule.args[0])))
+        remaining[rule] = len(premises)
+
+        for premise in premises:
+            dependents.setdefault(premise, []).append(rule)
+
+    known = set(facts)
+    processed = set()
+    agenda = list(facts)
+    reasons = {}
+    deductions = []
+
+    while agenda:
+        current = agenda.pop()
+
+        if current == query:
+            break
+
+        if current in processed:
             continue
-        reasons = []
-        for p in sorted(premises, key=lambda p: parse(p)[3]):
-            l = parse(p)[3]
-            # a Not is derived by one elimination rule, whose single premise
-            # is the Is that ruled the value out
-            cause = why.get(p, [None])[0]
-            if cause is None:
-                reasons.append((l, str(p), None, None, None))
-                continue
-            _, pr, pc, _ = parse(cause)
-            source = step_of.get((pr, pc), 'given')
-            reasons.append((l, str(p), (pr, pc),
-                            constraint((r, c), (pr, pc)), source))
-        steps.append({'cell': (r, c), 'value': v, 'symbol': str(concl),
-                      'reasons': reasons})
-        step_of[(r, c)] = len(steps)
-    return steps
+        processed.add(current)
 
+        for rule in dependents.get(current, []):
+            remaining[rule] -= 1
 
-def explain(step):
-    """Write out one deduction as a rule-firing chain in plain English."""
-    (r, c), v = step['cell'], step['value']
-    lines = []
-    for l, not_sym, cause, name, source in step['reasons']:
-        if cause is None:
-            lines.append(f'- Inferred `{not_sym}`: **{l}** is ruled out')
+            if remaining[rule] == 0:
+                conclusion = rule.args[1]
+
+                if conclusion not in known:
+                    premises = tuple(
+                        dict.fromkeys(conjuncts(rule.args[0]))
+                    )
+                    known.add(conclusion)
+                    reasons[conclusion] = premises
+                    deductions.append((conclusion, premises))
+                    agenda.append(conclusion)
+
+    if query not in known:
+        return False, [], []
+
+    # Find only the deductions supporting this particular query.
+    needed = set()
+    pending = [query]
+
+    while pending:
+        current = pending.pop()
+        if current in needed:
             continue
-        where = 'given' if source == 'given' else f'placed in step {source}'
-        lines.append(
-            f'- Inferred `{not_sym}`: **{l}** is ruled out because {name} '
-            f'already contains {l} at ({cause[0]}, {cause[1]}) ({where})'
-        )
-    st.markdown('\n'.join(lines))
-    st.markdown(f'⟹ Deduce `{step["symbol"]}`: every other value is ruled '
-                f'out, so **{v}** is the last remaining candidate for '
-                f'({r}, {c}).')
+
+        needed.add(current)
+        pending.extend(reasons.get(current, ()))
+
+    supporting_facts = sorted(needed & facts, key=str)
+    proof_steps = [
+        (conclusion, premises)
+        for conclusion, premises in deductions
+        if conclusion in needed
+    ]
+
+    return True, supporting_facts, proof_steps
 
 
-def step_title(i, step):
-    (r, c), v = step['cell'], step['value']
-    return f'Step {i}: cell ({r}, {c}) = {v}'
+# ---------- Main interface ----------
 
-
-st.header(f'Puzzle {option}')
-# one board: shows the givens now, redrawn with the solution once solved
-board = st.empty()
-render_grid(givens, givens, board)
-
-# --- 2. Full-grid auto-solver, with algorithm selection ---
-# label -> solver; every solver takes (n, box_h, box_w, givens)
-solvers = {
-    'Forward chaining': solve_full_grid_fc,
-    'Forward chaining (cached)': solve_full_grid_fc_cached,
-    'Backward chaining': solve_full_grid_bc,
-}
-# shown under each option in the radio
-notes = {
-    'Forward chaining': 'Disabled: unoptimised, takes about 10 min in testing',
-    'Forward chaining (cached)': 'Keeps what it derived between cell queries',
-    'Backward chaining': 'Goal-directed: proves each cell from the query back',
-}
-# listed so the implementation is visible, but too slow to run on the shared
-# server: one abandoned solve keeps a thread busy for every viewer
-disabled = {'Forward chaining'}
-# these also take a KB to solve on, so its derivations can be read back
-traced = {'Forward chaining (cached)', 'Backward chaining'}
-algorithm = st.sidebar.radio(
-    'Algorithm', list(solvers), captions=[notes[k] for k in solvers], index=1
+st.title("Sudoku Solver")
+st.write(
+    "Solve a puzzle using logical inference, or check a particular "
+    "cell and explore the reasoning."
 )
 
-if algorithm in disabled:
-    st.info(
-        'The unoptimised forward chaining solver is disabled here. Each cell '
-        'query re-runs forward chaining from scratch and discards what it '
-        'derived, so a full solve took about 10 minutes in testing. The '
-        'cached version keeps its work between queries.'
+try:
+    n, box_h, box_w, puzzles = load_puzzles()
+except (OSError, ValueError, KeyError) as error:
+    st.error(f"Could not load puzzles.json: {error}")
+    st.stop()
+
+if not puzzles:
+    st.error("No puzzles were found.")
+    st.stop()
+
+puzzle_index = st.selectbox(
+    "Choose a puzzle",
+    options=range(len(puzzles)),
+    format_func=lambda i: (
+        f"Puzzle {i + 1} — {len(puzzles[i]['givens'])} givens"
+    ),
+)
+
+givens = puzzles[puzzle_index]["givens"]
+
+# Clear results when switching to a different puzzle.
+if st.session_state.get("active_puzzle") != puzzle_index:
+    st.session_state["active_puzzle"] = puzzle_index
+    st.session_state.pop("solve_result", None)
+    st.session_state.pop("query_result", None)
+
+board_column, controls_column = st.columns([1, 1])
+
+with controls_column:
+    st.subheader("Solve the full grid")
+
+    algorithm = st.radio(
+        "Choose an algorithm",
+        ["Forward chaining", "Backward chaining"],
     )
-if st.button('Solve', disabled=algorithm in disabled):
-    with st.spinner(f'Solving with {algorithm.lower()}...', show_time=True):
-        start = time.perf_counter()
-        if algorithm in traced:
+
+    if st.button("Solve puzzle", type="primary"):
+        st.session_state.pop("solve_result", None)
+
+        with st.spinner(f"Solving with {algorithm.lower()}..."):
+            try:
+                solver = (
+                    solve_full_grid_fc
+                    if algorithm == "Forward chaining"
+                    else solve_full_grid_bc
+                )
+
+                start = time.perf_counter()
+                solved = solver(n, box_h, box_w, givens)
+                elapsed = time.perf_counter() - start
+
+                expected_cells = {
+                    (r, c)
+                    for r in range(1, n + 1)
+                    for c in range(1, n + 1)
+                }
+
+                if set(solved) != expected_cells:
+                    raise ValueError(
+                        "The solver did not return a complete grid."
+                    )
+
+                if any(solved[cell] != v for cell, v in givens.items()):
+                    raise ValueError("The result changed a given value.")
+
+                digits = set(range(1, n + 1))
+                units = []
+
+                for r in range(1, n + 1):
+                    units.append([solved[(r, c)]
+                                  for c in range(1, n + 1)])
+
+                for c in range(1, n + 1):
+                    units.append([solved[(r, c)]
+                                  for r in range(1, n + 1)])
+
+                for br in range(1, n + 1, box_h):
+                    for bc in range(1, n + 1, box_w):
+                        units.append([
+                            solved[(r, c)]
+                            for r in range(br, br + box_h)
+                            for c in range(bc, bc + box_w)
+                        ])
+
+                if any(set(unit) != digits for unit in units):
+                    raise ValueError("The result violates Sudoku rules.")
+
+                st.session_state["solve_result"] = {
+                    "values": solved,
+                    "elapsed": elapsed,
+                    "algorithm": algorithm,
+                }
+
+            except Exception as error:
+                st.error(f"Could not solve the puzzle: {error}")
+
+    result = st.session_state.get("solve_result")
+    if result:
+        st.success(
+            f"Solved with {result['algorithm'].lower()} "
+            f"in {result['elapsed']:.3f} seconds."
+        )
+
+with board_column:
+    st.subheader("Puzzle board")
+    result = st.session_state.get("solve_result")
+    values = result["values"] if result else givens
+    display_board(n, box_h, box_w, givens, values)
+
+
+# ---------- Targeted query ----------
+
+st.divider()
+st.subheader("Check a cell")
+
+row_column, column_column, value_column = st.columns(3)
+
+with row_column:
+    row = int(st.number_input("Row", 1, n, 1))
+with column_column:
+    column = int(st.number_input("Column", 1, n, 1))
+with value_column:
+    value = int(st.number_input("Value", 1, n, 1))
+
+show_trace = st.checkbox("Explain the reasoning", value=True)
+
+if st.button("Check using backward chaining"):
+    st.session_state.pop("query_result", None)
+
+    with st.spinner("Checking the query..."):
+        try:
             kb = build_definite_kb(n, box_h, box_w, givens)
-            solution = solvers[algorithm](n, box_h, box_w, givens, kb=kb)
-            steps = deductions(justifications(kb))
-        else:
-            solution = solvers[algorithm](n, box_h, box_w, givens)
-            steps = None
-        elapsed = time.perf_counter() - start
-    # kept across reruns so using the query below doesn't clear the result
-    st.session_state['solved'] = (option, algorithm, solution, elapsed, steps)
+            query = atom("Is", row, column, value)
 
-# only show a result that matches the current puzzle and algorithm
-solved = st.session_state.get('solved')
-if not (solved and solved[:2] == (option, algorithm)):
-    solved = None
-if solved:
-    solution, elapsed = solved[2:4]
-    render_grid(solution, givens, board)
-    st.caption('**Bold**: given, blue: solved')
-    st.write(f'Solved in {elapsed:.3f} s')
+            start = time.perf_counter()
+            verdict = bool(pl_bc_entails(kb, query))
+            elapsed = time.perf_counter() - start
 
-# --- 3. Targeted cell entailment query ---
-st.header('Cell entailment query')
-st.write('Ask whether the puzzle entails that a cell holds a value, using '
-         'backward chaining on the definite KB. Should take <1s.')
-col_r, col_c, col_v = st.columns(3)
-r = col_r.number_input('Row', min_value=1, max_value=n, step=1)
-c = col_c.number_input('Column', min_value=1, max_value=n, step=1)
-v = col_v.number_input('Value', min_value=1, max_value=n, step=1)
+            trace_result = None
+            if show_trace:
+                trace_result = trace_forward_query(kb, query)
 
-if st.button('Check'):
-    with st.spinner(f'Checking Is({r}, {c}, {v})...', show_time=True):
-        start = time.perf_counter()
-        kb = build_definite_kb(n, box_h, box_w, givens)
-        goal = atom('Is', r, c, v)
-        entailed = pl_bc_entails(kb, goal)
-        elapsed = time.perf_counter() - start
-        # read off the same KB, which still holds what the query derived
-        if entailed:
-            trace = deductions(dict(
-                (concl, premises) for premises, concl in proof_steps(kb, goal)
-            ))
-        else:
-            trace = sorted(parse(p)[3]
-                           for p in bc_unproven_premises(kb, goal)[0])
-    # kept across reruns, like the solved grid
-    st.session_state['query'] = (option, r, c, v, entailed, elapsed, trace)
+            st.session_state["query_result"] = {
+                "row": row,
+                "column": column,
+                "value": value,
+                "verdict": verdict,
+                "elapsed": elapsed,
+                "trace": trace_result,
+            }
 
-# only show a result for the current puzzle and inputs
-query = st.session_state.get('query')
-if not (query and query[:4] == (option, r, c, v)):
-    query = None
-if query:
-    entailed, elapsed, trace = query[4:]
-    message = f'KB ⊨ Is({r}, {c}, {v}): **{entailed}**'
-    if entailed:
-        st.success(message)
-    else:
-        st.error(message)
-    st.write(f'Checked in {elapsed:.3f} s')
+        except Exception as error:
+            st.error(f"Could not check the query: {error}")
 
-    # the reasoning behind this answer, right under it
-    st.subheader('Why?')
-    if (r, c) in givens:
-        if givens[(r, c)] == v:
-            st.write(f'({r}, {c}) = {v} is a given: it is a fact in the KB, '
-                     'so no rule needs to fire.')
-        else:
-            st.write(f'({r}, {c}) is given as {givens[(r, c)]}, which rules '
-                     f'out {v} for that cell.')
-    elif entailed:
-        st.write(
-            f'Backward chaining worked back from `Is{r}_{c}_{v}` to the '
-            f'givens. The proof needs {len(trace)} cell value(s), each '
-            'deduced as a last remaining candidate. The last step is the '
-            'query.'
-        )
-        for i, step in enumerate(trace, 1):
-            with st.expander(step_title(i, step), expanded=i == len(trace)):
-                explain(step)
-    else:
-        st.write(
-            f'The only rule that concludes `Is{r}_{c}_{v}` needs every other '
-            f'value ruled out for ({r}, {c}). Backward chaining could not '
-            f'rule out {", ".join(map(str, trace))}, so the rule never fires '
-            'and the query is not entailed.'
-        )
+result = st.session_state.get("query_result")
 
-# --- 4. Reasoning trace ("tutor mode") ---
-st.header('Reasoning trace')
-st.caption('How the full-grid solve above reached its answer, step by '
-           'step. The proof behind a cell query is shown under its result.')
-if not solved:
-    st.write('Solve the puzzle above to replay how it was deduced.')
-elif solved[4] is None:
-    st.write(f'{algorithm} does not record its reasoning.')
-else:
-    steps = solved[4]
+if result:
     st.write(
-        f'{algorithm} placed {len(steps)} values, each as the last '
-        'remaining candidate once every other value was ruled out by a '
-        'row, column or box. Use the buttons or slider to step through '
-        'them, in the order they were deduced.'
+        f"**Last checked:** Does cell "
+        f"({result['row']}, {result['column']}) "
+        f"contain {result['value']}?"
     )
-    st.caption(
-        f'<span style="background:{NEW_BG};padding:0 .4em">Yellow</span>'
-        ': the cell deduced at this step. '
-        f'<span style="background:{CAUSE_BG};padding:0 .4em">Blue</span>'
-        ': cells that ruled out its other values.',
-        unsafe_allow_html=True,
-    )
-    # reset the replay to the end whenever a new solve comes in
-    replay_id = (option, algorithm, id(steps))
-    if st.session_state.get('replay_id') != replay_id:
-        st.session_state['replay_id'] = replay_id
-        st.session_state['replay_step'] = len(steps)
-        st.session_state['playing'] = False
+    st.write(f"**Backward-chaining verdict: {result['verdict']}**")
+    st.caption(f"Query time: {result['elapsed']:.3f} seconds")
 
-    # Playing advances the slider one step per rerun: a widget's value
-    # can only be set before it is drawn, so each frame is a full rerun
-    # and the slider, board and step card all move together.
-    if st.session_state.pop('replay_advance', False):
-        st.session_state['replay_step'] += 1
+    if not result["verdict"]:
+        st.info(
+            "False means the value could not be proved from these "
+            "rules. It does not necessarily mean its opposite "
+            "was proved."
+        )
 
+    if result["trace"] is not None:
+        found, facts, steps = result["trace"]
+        st.subheader("Reasoning trace")
+        st.caption(
+            "The verdict above uses backward chaining. "
+            "This explanation is generated by a separate "
+            "forward-chaining run on the same knowledge base."
+        )
 
-    def toggle_play():
-        playing = not st.session_state['playing']
-        if playing and st.session_state['replay_step'] == len(steps):
-            # nothing left to play from the end, so start over
-            st.session_state['replay_step'] = 0
-        st.session_state['playing'] = playing
+        if found != result["verdict"]:
+            st.warning(
+                "Forward and backward chaining disagree. "
+                "Check the backward-chaining implementation."
+            )
 
+        if found:
+            with st.expander("Starting facts", expanded=True):
+                for fact in facts:
+                    st.write(f"• {describe_atom(fact)}.")
 
-    def stop_play():
-        st.session_state['playing'] = False
+            if not steps:
+                st.info("The queried value is already a known fact.")
 
-
-    def jump(to):
-        """Move to a step, clamped to the replay; stops playback."""
-        st.session_state['replay_step'] = max(0, min(len(steps), to))
-        st.session_state['playing'] = False
-
-
-    playing = st.session_state['playing']
-    current = st.session_state['replay_step']
-    at_start, at_end = current == 0, current == len(steps)
-    first, prev, play, nxt, last = st.columns(5)
-    first.button('⏮ First', on_click=jump, args=(0,), disabled=at_start,
-                 width='stretch')
-    prev.button('◀ Prev', on_click=jump, args=(current - 1,),
-                disabled=at_start, width='stretch')
-    play.button('⏸ Pause' if playing else '▶ Play', on_click=toggle_play,
-                width='stretch')
-    nxt.button('Next ▶', on_click=jump, args=(current + 1,),
-               disabled=at_end, width='stretch')
-    last.button('Last ⏭', on_click=jump, args=(len(steps),),
-                disabled=at_end, width='stretch')
-    # dragging the slider takes over from playback
-    k = st.slider('Step', 0, len(steps), key='replay_step',
-                  on_change=stop_play)
-
-    values = dict(givens)
-    for s in steps[:k]:
-        values[s['cell']] = s['value']
-    if k == 0:
-        render_grid(values, givens)
-    else:
-        causes = {reason[2] for reason in steps[k - 1]['reasons']}
-        render_grid(values, givens, new=steps[k - 1]['cell'],
-                    causes=causes)
-
-    if k == 0:
-        st.write('Step 0: only the givens are known.')
-    else:
-        with st.container(border=True):
-            st.markdown(f'**{step_title(k, steps[k - 1])}**')
-            explain(steps[k - 1])
-
-    # a toggle rather than an expander, since expanders can't nest and
-    # each step is already one
-    if st.toggle(f'Show all {len(steps)} steps', key='show_all_steps'):
-        for i, step in enumerate(steps, 1):
-            with st.expander(step_title(i, step)):
-                explain(step)
-
-    # the next frame is queued at the end of the script, once everything
-    # else on the page has been drawn
-    if playing:
-        replay_done = k == len(steps)
-
-# --- Replay playback: advance one frame per rerun ---
-if st.session_state.get('playing') and 'replay_done' in globals():
-    if replay_done:
-        st.session_state['playing'] = False
-    else:
-        # clicking Pause during the wait interrupts this run, so the next
-        # frame is never queued
-        time.sleep(0.4)
-        st.session_state['replay_advance'] = True
-    st.rerun()
+            for number, (conclusion, premises) in enumerate(steps, 1):
+                with st.expander(
+                    f"Step {number}: {describe_atom(conclusion)}"
+                ):
+                    st.write(explain_rule(conclusion, premises))
+        else:
+            st.info(
+                "Forward chaining exhausted its deductions without "
+                "proving this query, so no successful proof is available."
+            )
